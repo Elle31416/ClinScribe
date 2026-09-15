@@ -101,7 +101,7 @@ Edit `.env`:
 
 ```env
 ASSEMBLYAI_API_KEY=your_key_here
-AGENT_ID=           # filled after publish step
+AGENT_ID=agent_b0aca15004de4ab2b39bbfc1ce360956
 ```
 
 Get your API key from https://www.assemblyai.com/dashboard
