@@ -49,24 +49,29 @@ Browser state (transcript, entities, SOAP, actions)
 
 ```
 .
-├── page.tsx              # Main UI: start / live / summary screens (app/page.tsx in standard layout)
-├── layout.tsx            # Root layout
-├── globals.css           # Styles
-├── route.ts              # API route: /api/voice-token (app/api/voice-token/route.ts)
-├── types.ts              # Shared types (lib/types.ts)
-├── export.ts             # TXT/JSON export helpers (lib/export.ts)
-├── voice-session.ts      # VoiceSession class - WS + audio pipeline (lib/voice-session.ts)
-├── pcm-processor.js      # AudioWorklet processor (public/pcm-processor.js)
-├── publish-agent.ts      # One-time agent publish script (scripts/publish-agent.ts)
+├── app/
+│   ├── layout.tsx                 # Root layout
+│   ├── page.tsx                   # Main UI: start / live / summary screens
+│   ├── globals.css                # Styles
+│   └── api/
+│       └── voice-token/
+│           └── route.ts           # GET /api/voice-token (mints short-lived token)
+├── lib/
+│   ├── types.ts                   # Shared types
+│   ├── export.ts                  # TXT/JSON export helpers
+│   └── voice-session.ts           # VoiceSession class - WS + audio pipeline
+├── public/
+│   └── pcm-processor.js           # AudioWorklet processor (served at /pcm-processor.js)
+├── scripts/
+│   └── publish-agent.ts           # One-time agent publish script
+├── next.config.ts
 ├── package.json
 ├── tsconfig.json
-├── .env                  # Local secrets (gitignored)
-├── .env.example          # Example env
+├── .env                           # Local secrets (gitignored)
+├── .env.example                   # Example env
 ├── .gitignore
-└── HANDOFF.md            # Full spec + conversation handoff
+└── HANDOFF.md                     # Full spec + conversation handoff
 ```
-
-> Note: This repo currently has files flattened at root for hackathon handoff. For a clean Next.js app, move them to `app/`, `lib/`, `public/`, `scripts/` as indicated above.
 
 ## 🚀 Quick Start
 
@@ -106,11 +111,11 @@ Get your API key from https://www.assemblyai.com/dashboard
 This creates/updates the stored agent on AssemblyAI with system prompt, voice, and 3 function tools.
 
 ```bash
-# loads .env and runs the publisher
-npx tsx publish-agent.ts
-
-# or via npm script (if you moved file to scripts/)
+# loads .env automatically, then creates or updates the stored agent
 npm run agent:publish
+
+# or directly
+npx tsx scripts/publish-agent.ts
 ```
 
 Copy the printed `agent_...` ID into `.env` as `AGENT_ID`.

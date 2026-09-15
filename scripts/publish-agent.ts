@@ -1,10 +1,47 @@
 import "node:process";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+/**
+ * `tsx` does not load `.env` files on its own, so this script would always
+ * throw "Set ASSEMBLYAI_API_KEY" even with a populated `.env`. Load the env
+ * files here (lowest priority last) without overwriting anything already set
+ * in the real environment.
+ */
+function loadEnvFiles() {
+  for (const file of [".env", ".env.local"]) {
+    let contents: string;
+    try {
+      contents = readFileSync(resolve(process.cwd(), file), "utf8");
+    } catch {
+      continue;
+    }
+
+    for (const line of contents.split("\n")) {
+      const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(
+        line,
+      );
+      if (!match) continue;
+
+      const key = match[1];
+      const rawValue = match[2].trim();
+      const value = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+
+      if (!(key in process.env)) process.env[key] = value;
+    }
+  }
+}
+
+loadEnvFiles();
 
 const apiKey = process.env.ASSEMBLYAI_API_KEY;
 const existingAgentId = process.env.AGENT_ID;
 
 if (!apiKey) {
-  throw new Error("Set ASSEMBLYAI_API_KEY before publishing the agent.");
+  throw new Error(
+    "Set ASSEMBLYAI_API_KEY before publishing the agent. " +
+      "Copy .env.example to .env and fill in your key.",
+  );
 }
 
 const systemPrompt = `
@@ -139,27 +176,36 @@ const body = {
   tools,
 };
 
-const endpoint = existingAgentId
-  ? `https://agents.assemblyai.com/v1/agents/${existingAgentId}`
-  : "https://agents.assemblyai.com/v1/agents";
+async function main() {
+  const endpoint = existingAgentId
+    ? `https://agents.assemblyai.com/v1/agents/${existingAgentId}`
+    : "https://agents.assemblyai.com/v1/agents";
 
-const response = await fetch(endpoint, {
-  method: existingAgentId ? "PUT" : "POST",
-  headers: {
-    Authorization: apiKey,
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify(body),
-});
+  const response = await fetch(endpoint, {
+    method: existingAgentId ? "PUT" : "POST",
+    headers: {
+      Authorization: apiKey as string,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
 
-const text = await response.text();
-if (!response.ok) {
-  throw new Error(`Agent publish failed (${response.status}): ${text}`);
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Agent publish failed (${response.status}): ${text}`);
+  }
+
+  const agent = JSON.parse(text) as { id: string };
+  console.log(
+    existingAgentId
+      ? `Updated agent ${agent.id}`
+      : `Created agent ${agent.id}\nAdd AGENT_ID=${agent.id} to .env`,
+  );
 }
 
-const agent = JSON.parse(text) as { id: string };
-console.log(
-  existingAgentId
-    ? `Updated agent ${agent.id}`
-    : `Created agent ${agent.id}\nAdd AGENT_ID=${agent.id} to .env.local`,
-);
+// Top-level await is not supported when tsx compiles to CJS (this package has
+// no "type": "module"), so the async work lives in main().
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});
