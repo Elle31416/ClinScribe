@@ -190,6 +190,7 @@ small {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin: 0;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: white;
@@ -410,6 +411,25 @@ small {
 .checklist input:focus {
   outline: 3px solid #cceadf;
   border-color: var(--brand);
+}
+
+/* Keyboard focus must stay visible on every control, including the dark bar. */
+:where(button, input, textarea, [role="tab"]):focus-visible {
+  outline: 3px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.callControls :where(button):focus-visible {
+  outline-color: #8fd8c0;
+}
+
+.fieldHint {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 500;
+  text-transform: none;
 }
 
 .checklist {

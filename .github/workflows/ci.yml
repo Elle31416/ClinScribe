@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Type-check, lint, and unit tests (protocol state, audio resampling,
+      # export packets, rate limiter, screen rendering).
+      - run: npm run verify
+
+      # A production build is the only thing that catches React Server
+      # Component and bundling regressions.
+      - run: npm run build

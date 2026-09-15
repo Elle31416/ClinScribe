@@ -21,10 +21,10 @@ ClinScribe is a real-time voice agent built for the AssemblyAI Voice Agent Hacka
 
 ## 🧱 Tech Stack
 
-- **Frontend:** Next.js 15 + React 19 + TypeScript
+- **Frontend:** Next.js 15.5 + React 19 + TypeScript
 - **Backend:** Next.js API Routes (Node.js runtime)
-- **Voice:** AssemblyAI Voice Agent API + AssemblyAI SDK `4.41.1`
-- **Audio:** Web Audio API + AudioWorklet (`pcm-processor.js`) — PCM16 mono 24kHz with cross-browser resampling
+- **Voice:** AssemblyAI Voice Agent API — called directly over its REST and WebSocket endpoints, no SDK in the client bundle
+- **Audio:** Web Audio API + AudioWorklet (`pcm-processor.js`) — PCM16 mono 24kHz, resampled and batched in the audio thread
 - **Hosting:** Vercel-ready (or Render for long-lived processes)
 
 ## 🏗️ Architecture
@@ -41,8 +41,8 @@ Browser state (transcript, entities, SOAP, actions)
    +--> /api/voice-token (server) mints short-lived token
 ```
 
-- `GET /api/voice-token` → mints token (120s redemption, 1800s max duration) using `ASSEMBLYAI_API_KEY` server-side. Browser never sees API key.
-- Stored agent config lives on AssemblyAI side, created via `publish-agent.ts`.
+- `GET /api/voice-token` → mints a token (120 s redemption window, 1800 s max session) using `ASSEMBLYAI_API_KEY` server-side. The browser never sees the API key. Requests are rate-limited per IP (5/min, in-memory — swap for a real limiter before this is public).
+- Stored agent config lives on the AssemblyAI side, created via `publish-agent.ts`.
 - No database for MVP — in-memory browser state, exported locally.
 
 ## 📁 Project Structure
@@ -51,24 +51,41 @@ Browser state (transcript, entities, SOAP, actions)
 .
 ├── app/
 │   ├── layout.tsx                 # Root layout
-│   ├── page.tsx                   # Main UI: start / live / summary screens
+│   ├── page.tsx                   # Screen state + session wiring (<200 lines)
 │   ├── globals.css                # Styles
+│   ├── components/                # Presentational, memoised screen pieces
+│   │   ├── StartScreen.tsx
+│   │   ├── LiveScreen.tsx         # Captions + flags + actions + call controls
+│   │   ├── SummaryScreen.tsx      # Tabs with ARIA tab semantics
+│   │   ├── LiveCaptions.tsx       # role="log" live region, pinned autoscroll
+│   │   ├── TranscriptView.tsx     # Finalised transcript only
+│   │   ├── SoapEditor.tsx         # Editable S/O/A/P
+│   │   ├── ActionChecklist.tsx    # Tick / edit / remove
+│   │   ├── FlaggedMentions.tsx
+│   │   ├── SuggestedActions.tsx
+│   │   ├── CaptionRow.tsx
+│   │   ├── StatusPill.tsx
+│   │   └── usePinnedScroll.ts     # Follow-the-end scroll, yields to the user
 │   └── api/
 │       └── voice-token/
 │           └── route.ts           # GET /api/voice-token (mints short-lived token)
 ├── lib/
 │   ├── types.ts                   # Shared types
-│   ├── export.ts                  # TXT/JSON export helpers
+│   ├── session-state.ts           # Pure reducers: caption merge, dedupe, packet
+│   ├── audio.ts                   # PCM16/base64 helpers, frame + backpressure constants
+│   ├── export.ts                  # Packet builders + TXT/JSON download
+│   ├── rate-limit.ts              # Fixed-window IP limiter for the token route
 │   └── voice-session.ts           # VoiceSession class - WS + audio pipeline
 ├── public/
-│   └── pcm-processor.js           # AudioWorklet processor (served at /pcm-processor.js)
+│   └── pcm-processor.js           # AudioWorklet: resample + 50 ms batching
 ├── scripts/
 │   └── publish-agent.ts           # One-time agent publish script
+├── tests/                         # node:test suites (npm test)
+├── .github/workflows/ci.yml       # verify + build on every push/PR
 ├── next.config.ts
 ├── package.json
 ├── tsconfig.json
-├── .env                           # Local secrets (gitignored)
-├── .env.example                   # Example env
+├── .env.example
 ├── .gitignore
 └── HANDOFF.md                     # Full spec + conversation handoff
 ```
@@ -77,7 +94,7 @@ Browser state (transcript, entities, SOAP, actions)
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 18.18+ (22 recommended)
 - AssemblyAI account with **credit card on file** (required for Voice Agent API)
 - Chrome/Edge recommended (Firefox/Safari tested)
 
@@ -86,7 +103,7 @@ Browser state (transcript, entities, SOAP, actions)
 ```bash
 git clone https://github.com/Elle31416/ClinScribe.git
 cd ClinScribe
-npm install
+npm ci
 ```
 
 ### 2. Environment
@@ -157,13 +174,29 @@ Open http://localhost:3000 — localhost is a secure context, so mic permission 
 | `npm run dev` | Start Next.js dev server |
 | `npm run build` | Production build |
 | `npm run start` | Start production server |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | ESLint (Next core-web-vitals + TypeScript rules) |
+| `npm test` | Unit + component + protocol tests via `node:test` |
+| `npm run verify` | typecheck + lint + test (run before pushing; CI runs it too) |
 | `npm run agent:publish` | Publish/update stored agent on AssemblyAI |
+
+## 🧪 Testing
+
+No browser or network is needed: the suite runs on Node's built-in test runner.
+
+- `tests/session-state.test.ts` — caption merge semantics (cumulative user deltas vs. word-level agent deltas), entity/action de-duplication
+- `tests/audio.test.ts` — PCM16 ⇄ base64 round-trips, backpressure threshold
+- `tests/pcm-processor.test.ts` — runs the real AudioWorklet file inside `node:vm`: 48/44.1/32 kHz resampling, tone fidelity, frame batching, clipping
+- `tests/voice-session.test.ts` — drives `VoiceSession` against fake WebSocket/Web Audio/fetch: token binding, tool-result timing, barge-in, teardown
+- `tests/export.test.ts` — TXT/JSON packet shape, no partial captions in exports
+- `tests/rate-limit.test.ts` — limiter windows and bounded memory
+- `tests/screens.test.tsx` — server-renders each screen to catch markup/ARIA regressions
 
 ## 🔐 Environment Variables
 
 | Var | Required | Description |
 |-----|----------|-------------|
-| `ASSEMBLYAI_API_KEY` | Yes | Your AssemblyAI API key (raw key, no Bearer prefix for agent REST; Bearer for token route) |
+| `ASSEMBLYAI_API_KEY` | Yes | Your AssemblyAI API key (raw key for agent REST; Bearer for the token route) |
 | `AGENT_ID` | Yes | Stored agent ID (`agent_b0aca15004de4ab2b39bbfc1ce360956`) |
 | `PUBLIC_BASE_URL` | No (stretch) | Public HTTPS URL for HTTP tool webhooks — not needed for client-side tool MVP |
 
@@ -172,11 +205,12 @@ All `.env*` files are gitignored. Only `.env.example` is committed.
 ## 🎤 Audio Pipeline Details
 
 - `getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true }})`
-- AudioWorklet resamples from `AudioContext.sampleRate` → 24kHz PCM16 mono
+- The AudioWorklet resamples from the device rate to 24 kHz PCM16 mono with a phase-continuous interpolator (no drift, no click at block boundaries) and posts **50 ms frames** instead of one message per 128-frame render quantum — ~20 sends/s instead of ~375.
 - Base64-encoded PCM sent as `{ type: "input.audio", audio: b64 }`
-- Playback: `reply.audio` (base64 PCM16) → Float32 → AudioBuffer → scheduled playback
-- Interruption: `input.speech.started` flushes playback sources immediately
-- End: `session.end` sent explicitly, never just `ws.close()` (avoids 30s billable resume window)
+- If the socket backs up (`bufferedAmount` over 256 kB), frames are dropped rather than queued: the server discards audio delivered faster than real time, so buffering only makes captions late.
+- Playback: `reply.audio` (base64 PCM16) → Float32 → AudioBuffer → scheduled back-to-back on the audio clock
+- Interruption: `input.speech.started` / `reply.done: interrupted` stops every scheduled source immediately
+- End: `session.end` sent explicitly, never just `ws.close()` (avoids the 30 s billable resume window), with a 5 s local fallback if `session.ended` never arrives
 
 ## 📤 Export Format
 
@@ -187,7 +221,7 @@ AI VOICE INTAKE SCRIBE — ENCOUNTER PACKET
 Patient: ...
 Agent: ...
 === FLAGGED MENTIONS (SUGGESTED) ===
-- drug: 20mg of Lisinopril — ...
+- Drug: 20 mg Lisinopril — takes daily
 === SOAP NOTE (AI-DRAFTED — REVIEW BEFORE USE) ===
 Subjective: ...
 ...
@@ -213,15 +247,19 @@ Subjective: ...
 - All outputs labeled draft/suggested
 - Agent never gives diagnosis, advice, or dosage guidance (enforced in system prompt)
 - Session artifacts (audio OGG/Opus, timeline JSON) are stored by AssemblyAI until deleted via `DELETE /v1/sessions/{id}` — so do not claim zero-retention unless you add deletion
+- Responses carry `X-Content-Type-Options`, `Referrer-Policy`, and a `Permissions-Policy` that allows only the microphone (required: the app is often embedded in a cross-origin preview frame)
+- The token endpoint is rate-limited per IP in memory; anyone who can reach a deployed instance can still spend your AssemblyAI credit, so add real edge protection before making it public
 - Production with real PHI requires AssemblyAI BAA + retention/deletion policy (out of scope for hackathon)
 
 ## 🗺️ Roadmap / Stretch
 
 - [ ] Safety-net pass: fetch timeline artifact → LLM Gateway (Claude Sonnet) with strict `json_schema` response_format → reconcile with live SOAP
+- [ ] Show flagged mentions on the summary screen (currently only in the live view and the export)
 - [ ] Multi-language: `input.language_codes` (18 langs) + output voice per language
 - [ ] Phone via Twilio
 - [ ] Bluejay simulated-caller QA
 - [ ] Real DB + auth for multi-session
+- [ ] Next.js 16 upgrade (Turbopack builds, clears the remaining transitive `postcss` advisories in `npm audit`)
 
 ## 🧪 Verified Gotchas (from live docs check)
 
@@ -229,6 +267,7 @@ Subjective: ...
 - `ivy` voice ID not in current list — use `alba`, `eve`, etc.
 - Token route uses `Authorization: Bearer <key>`, agent REST uses raw key.
 - User deltas are cumulative, agent deltas are word-level append.
+- `tool.result` may only be sent while `reply.done` is the most recent event; results are held otherwise.
 - Browser cannot guarantee final WS frame on tab close — `pagehide` is best-effort, End button is reliable.
 
 ## 📄 License
