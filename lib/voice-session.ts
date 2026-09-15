@@ -1,6 +1,13 @@
+import {
+  base64ToPcm16,
+  bytesToBase64,
+  CAPTURE_FRAME_MS,
+  hasSocketHeadroom,
+  OUTPUT_RATE,
+  pcm16ToFloat32,
+} from "./audio";
+import { createId } from "./session-state";
 import type { ActionItem, Caption, Entity, SoapNote, Status } from "./types";
-
-const OUTPUT_RATE = 24000;
 
 type VoiceCallbacks = {
   onStatus: (status: Status) => void;
@@ -23,19 +30,19 @@ type PendingTool = {
   result: Record<string, unknown>;
 };
 
-function id(prefix: string) {
-  return `${prefix}-${crypto.randomUUID()}`;
-}
+type SessionToken = {
+  token: string;
+  agentId: string;
+};
 
-function bytesToBase64(buffer: ArrayBuffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
-}
+const TOKEN_TIMEOUT_MS = 15_000;
+const END_GRACE_MS = 5_000;
 
+/**
+ * Owns one Voice Agent session: the microphone capture graph, the WebSocket, the
+ * playback queue, and the client-side tool calls. The UI only sees callbacks, so
+ * nothing in here touches React state directly.
+ */
 export class VoiceSession {
   private ws: WebSocket | null = null;
   private audioContext: AudioContext | null = null;
@@ -46,6 +53,12 @@ export class VoiceSession {
   private ready = false;
   private ending = false;
   private cleanEnded = false;
+  private finished = false;
+  private disposed = false;
+  private endTimer: number | null = null;
+  private releasePromise: Promise<void> | null = null;
+  private droppedFrames = 0;
+  private warnedBackpressure = false;
   private playbackTime = 0;
   private playbackSources = new Set<AudioBufferSourceNode>();
   private lastEvent: string | null = null;
@@ -60,88 +73,52 @@ export class VoiceSession {
     try {
       this.callbacks.onStatus("requesting-mic");
 
-      this.audioContext = new AudioContext();
-      await this.audioContext.resume();
-      await this.audioContext.audioWorklet.addModule("/pcm-processor.js");
+      // Capture setup and token minting are independent, so they run together:
+      // the mic permission prompt and the round trip to /api/voice-token overlap
+      // instead of queueing up (~0.5 s off time-to-first-word).
+      const [, session] = await Promise.all([
+        this.setupCapture(),
+        this.requestSession(),
+      ]);
 
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: false,
-          autoGainControl: true,
-        },
-      });
-
-      this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
-      this.workletNode = new AudioWorkletNode(
-        this.audioContext,
-        "pcm-processor",
-        {
-          processorOptions: {
-            inputSampleRate: this.audioContext.sampleRate,
-            targetSampleRate: OUTPUT_RATE,
-          },
-        },
-      );
-
-      // Keep the capture graph active without echoing mic audio to speakers.
-      this.silentGain = this.audioContext.createGain();
-      this.silentGain.gain.value = 0;
-      this.sourceNode.connect(this.workletNode);
-      this.workletNode.connect(this.silentGain);
-      this.silentGain.connect(this.audioContext.destination);
+      if (this.disposed) return;
 
       this.callbacks.onStatus("connecting");
-      const tokenResponse = await fetch("/api/voice-token", {
-        cache: "no-store",
-      });
-      const tokenData = (await tokenResponse.json()) as {
-        token?: string;
-        agentId?: string;
-        error?: string;
-        detail?: string;
-      };
-
-      if (!tokenResponse.ok || !tokenData.token || !tokenData.agentId) {
-        throw new Error(
-          tokenData.detail || tokenData.error || "Token request failed.",
-        );
-      }
 
       const wsUrl = new URL("wss://agents.assemblyai.com/v1/ws");
-      wsUrl.searchParams.set("token", tokenData.token);
-      this.ws = new WebSocket(wsUrl);
+      wsUrl.searchParams.set("token", session.token);
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
 
-      this.workletNode.port.onmessage = ({ data }: MessageEvent<ArrayBuffer>) => {
-        if (this.ready && this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(
-            JSON.stringify({
-              type: "input.audio",
-              audio: bytesToBase64(data),
-            }),
-          );
+      ws.addEventListener("open", () => {
+        if (this.disposed) return;
+        this.send({ type: "session.update", session: { agent_id: session.agentId } });
+      });
+
+      ws.addEventListener("message", (event) => {
+        if (this.disposed) return;
+        let message: ServerMessage;
+        try {
+          message = JSON.parse(String(event.data)) as ServerMessage;
+        } catch {
+          return; // Ignore a malformed frame rather than tearing down the call.
         }
-      };
-
-      this.ws.addEventListener("open", () => {
-        this.send({
-          type: "session.update",
-          session: { agent_id: tokenData.agentId },
-        });
+        void this.handleMessage(message);
       });
 
-      this.ws.addEventListener("message", (event) => {
-        void this.handleMessage(JSON.parse(event.data) as ServerMessage);
-      });
-
-      this.ws.addEventListener("error", () => {
+      ws.addEventListener("error", () => {
+        if (this.disposed) return;
         this.callbacks.onError("The voice connection encountered an error.");
       });
 
-      this.ws.addEventListener("close", (event) => {
+      ws.addEventListener("close", (event) => {
         const wasClean = this.cleanEnded || this.ending;
         void this.releaseResources();
-        if (!wasClean) {
+
+        if (wasClean) {
+          // Defensive: normally session.ended already finished the call.
+          this.finish();
+        } else {
           this.callbacks.onStatus("error");
           this.callbacks.onError(
             `Connection closed unexpectedly (code ${event.code}${
@@ -169,28 +146,125 @@ export class VoiceSession {
     this.flushPlayback();
 
     if (this.ws?.readyState === WebSocket.OPEN) {
+      // session.end stops the billable 30-second resume grace window; the server
+      // answers with session.ended, and cleanup happens there.
       this.send({ type: "session.end" });
-
-      // Fall back to local cleanup if the final event never arrives.
-      window.setTimeout(() => {
-        if (!this.cleanEnded) {
-          void this.releaseResources();
-          this.callbacks.onStatus("ended");
-          this.callbacks.onEnded();
-        }
-      }, 5000);
+      this.endTimer = window.setTimeout(() => {
+        if (this.finished) return;
+        void this.releaseResources();
+        this.finish();
+      }, END_GRACE_MS);
     } else {
       void this.releaseResources();
-      this.callbacks.onStatus("ended");
-      this.callbacks.onEnded();
+      this.finish();
     }
   }
 
+  /** pagehide must stay synchronous: anything awaited will not finish. */
   endForPageHide() {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "session.end" }));
     }
     this.stopCapture();
+  }
+
+  private async setupCapture() {
+    const audioContext = new AudioContext();
+    // Held on the instance immediately, so teardown closes the context even if
+    // the microphone prompt is still open (or was denied) when start() fails.
+    this.audioContext = audioContext;
+    await audioContext.resume();
+    await audioContext.audioWorklet.addModule("/pcm-processor.js");
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true, // required: without it the agent hears itself
+        noiseSuppression: false, // the server denoises already
+        autoGainControl: true,
+      },
+    });
+
+    if (this.disposed) {
+      stream.getTracks().forEach((track) => track.stop());
+      await audioContext.close().catch(() => undefined);
+      return;
+    }
+
+    const workletNode = new AudioWorkletNode(audioContext, "pcm-processor", {
+      processorOptions: {
+        inputSampleRate: audioContext.sampleRate,
+        targetSampleRate: OUTPUT_RATE,
+        frameMs: CAPTURE_FRAME_MS,
+      },
+    });
+
+    // Keep the capture graph pulled without echoing mic audio to the speakers.
+    const silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
+
+    const sourceNode = audioContext.createMediaStreamSource(stream);
+    sourceNode.connect(workletNode);
+    workletNode.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+
+    workletNode.port.onmessage = ({ data }: MessageEvent<ArrayBuffer>) => {
+      this.sendAudio(data);
+    };
+
+    this.stream = stream;
+    this.sourceNode = sourceNode;
+    this.workletNode = workletNode;
+    this.silentGain = silentGain;
+    this.playbackTime = audioContext.currentTime;
+  }
+
+  private async requestSession(): Promise<SessionToken> {
+    let response: Response;
+    try {
+      response = await fetch("/api/voice-token", {
+        cache: "no-store",
+        signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+      });
+    } catch {
+      throw new Error(
+        "Could not reach the token endpoint. Check the network and try again.",
+      );
+    }
+
+    const data = (await response.json().catch(() => ({}))) as Partial<SessionToken> & {
+      error?: string;
+      detail?: string;
+    };
+
+    if (!response.ok || !data.token || !data.agentId) {
+      throw new Error(data.detail || data.error || "Token request failed.");
+    }
+
+    return { token: data.token, agentId: data.agentId };
+  }
+
+  private sendAudio(buffer: ArrayBuffer) {
+    const ws = this.ws;
+    if (!this.ready || ws?.readyState !== WebSocket.OPEN) return;
+
+    if (!hasSocketHeadroom(ws.bufferedAmount)) {
+      this.droppedFrames += 1;
+      if (!this.warnedBackpressure) {
+        this.warnedBackpressure = true;
+        console.warn(
+          `Audio uplink congested (dropped ${this.droppedFrames} frame(s)); ` +
+            "dropping frames instead of queueing so captions stay real time.",
+        );
+      }
+      return;
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: "input.audio",
+        audio: bytesToBase64(new Uint8Array(buffer)),
+      }),
+    );
   }
 
   private send(message: Record<string, unknown>) {
@@ -217,7 +291,7 @@ export class VoiceSession {
 
     if (type === "input.speech.started") {
       this.lastEvent = type;
-      // Early flush makes interruption feel immediate.
+      // Barge-in: drop queued agent audio so the interruption is immediate.
       this.flushPlayback();
       return;
     }
@@ -248,9 +322,8 @@ export class VoiceSession {
     }
 
     if (type === "transcript.agent.delta") {
-      const captionId = String(message.reply_id);
       this.callbacks.onCaption({
-        id: captionId,
+        id: String(message.reply_id),
         role: "agent",
         text: String(message.delta),
         final: false,
@@ -293,8 +366,7 @@ export class VoiceSession {
       this.cleanEnded = true;
       this.ready = false;
       await this.releaseResources();
-      this.callbacks.onStatus("ended");
-      this.callbacks.onEnded();
+      this.finish();
       return;
     }
 
@@ -308,38 +380,28 @@ export class VoiceSession {
     }
   }
 
-  private handleToolCall(
-    callId: string,
-    name: string,
-    args: Record<string, unknown>,
-  ) {
+  private handleToolCall(callId: string, name: string, args: Record<string, unknown>) {
     try {
       if (name === "flag_medical_entity") {
         const entity: Entity = {
-          id: id("entity"),
+          id: createId("entity"),
           entityType: String(args.entity_type) as Entity["entityType"],
           text: String(args.text ?? ""),
           note: String(args.note ?? ""),
         };
         this.callbacks.onEntity(entity);
-        this.pendingTools.push({
-          callId,
-          result: { ok: true, recorded: entity.text },
-        });
+        this.pendingTools.push({ callId, result: { ok: true, recorded: entity.text } });
         return;
       }
 
       if (name === "add_followup_item") {
         const action: ActionItem = {
-          id: id("action"),
+          id: createId("action"),
           item: String(args.item ?? ""),
           done: false,
         };
         this.callbacks.onActionItem(action);
-        this.pendingTools.push({
-          callId,
-          result: { ok: true, recorded: action.item },
-        });
+        this.pendingTools.push({ callId, result: { ok: true, recorded: action.item } });
         return;
       }
 
@@ -353,10 +415,7 @@ export class VoiceSession {
         this.callbacks.onSoapNote(note);
         this.pendingTools.push({
           callId,
-          result: {
-            ok: true,
-            message: "Draft recorded for clinician review.",
-          },
+          result: { ok: true, message: "Draft recorded for clinician review." },
         });
         return;
       }
@@ -368,13 +427,15 @@ export class VoiceSession {
     } catch (error) {
       this.pendingTools.push({
         callId,
-        result: {
-          error: error instanceof Error ? error.message : "Tool failed.",
-        },
+        result: { error: error instanceof Error ? error.message : "Tool failed." },
       });
     }
   }
 
+  /**
+   * Tool results may only be sent while `reply.done` is the latest event, so
+   * anything queued earlier waits here (the server drives the turn-taking).
+   */
   private flushToolsIfIdle() {
     if (
       this.lastEvent !== "reply.done" ||
@@ -399,22 +460,17 @@ export class VoiceSession {
     const context = this.audioContext;
     if (!context || context.state === "closed") return;
 
-    const raw = atob(base64);
-    const pcm = new Int16Array(Math.floor(raw.length / 2));
-    for (let i = 0; i < pcm.length; i++) {
-      const value =
-        raw.charCodeAt(i * 2) | (raw.charCodeAt(i * 2 + 1) << 8);
-      pcm[i] = value >= 0x8000 ? value - 0x10000 : value;
-    }
+    const samples = base64ToPcm16(base64);
+    if (!samples.length) return;
 
-    const buffer = context.createBuffer(1, pcm.length, OUTPUT_RATE);
-    const channel = buffer.getChannelData(0);
-    for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+    const buffer = context.createBuffer(1, samples.length, OUTPUT_RATE);
+    buffer.getChannelData(0).set(pcm16ToFloat32(samples));
 
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.connect(context.destination);
 
+    // Schedule back to back on the audio clock: no gaps, no drift.
     const startAt = Math.max(context.currentTime, this.playbackTime);
     source.start(startAt);
     this.playbackTime = startAt + buffer.duration;
@@ -440,30 +496,52 @@ export class VoiceSession {
   }
 
   private stopCapture() {
+    if (this.workletNode) this.workletNode.port.onmessage = null;
     this.stream?.getTracks().forEach((track) => track.stop());
     this.sourceNode?.disconnect();
     this.workletNode?.disconnect();
     this.silentGain?.disconnect();
   }
 
-  private async releaseResources() {
+  /** Idempotent: every teardown path funnels through here. */
+  private releaseResources(): Promise<void> {
+    this.releasePromise ??= this.dispose();
+    return this.releasePromise;
+  }
+
+  private async dispose() {
     this.ready = false;
+    this.disposed = true;
+
+    if (this.endTimer !== null) {
+      window.clearTimeout(this.endTimer);
+      this.endTimer = null;
+    }
+
     this.stopCapture();
     this.flushPlayback();
 
-    if (this.ws && this.ws.readyState < WebSocket.CLOSING) {
-      this.ws.close();
-    }
-
-    if (this.audioContext && this.audioContext.state !== "closed") {
-      await this.audioContext.close().catch(() => undefined);
-    }
-
+    const ws = this.ws;
     this.ws = null;
+    if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+
+    const context = this.audioContext;
+    this.audioContext = null;
     this.stream = null;
     this.sourceNode = null;
     this.workletNode = null;
     this.silentGain = null;
-    this.audioContext = null;
+
+    if (context && context.state !== "closed") {
+      await context.close().catch(() => undefined);
+    }
+  }
+
+  /** Announce the end exactly once, whatever triggered it. */
+  private finish() {
+    if (this.finished) return;
+    this.finished = true;
+    this.callbacks.onStatus("ended");
+    this.callbacks.onEnded();
   }
 }

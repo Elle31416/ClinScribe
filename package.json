@@ -6,11 +6,14 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "TSX_TSCONFIG_PATH=tests/tsconfig.json node --import tsx --test tests/*.test.ts tests/*.test.tsx",
+    "verify": "npm run typecheck && npm run lint && npm test",
     "agent:publish": "tsx scripts/publish-agent.ts"
   },
   "dependencies": {
-    "assemblyai": "4.41.1",
-    "next": "15.5.3",
+    "next": "15.5.25",
     "react": "19.1.1",
     "react-dom": "19.1.1"
   },
@@ -18,7 +21,12 @@
     "@types/node": "22.18.3",
     "@types/react": "19.1.13",
     "@types/react-dom": "19.1.9",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "15.5.25",
     "tsx": "4.20.5",
     "typescript": "5.9.2"
+  },
+  "engines": {
+    "node": ">=18.18.0"
   }
 }
