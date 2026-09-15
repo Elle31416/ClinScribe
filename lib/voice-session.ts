@@ -138,13 +138,15 @@ export class VoiceSession {
         this.callbacks.onError("The voice connection encountered an error.");
       });
 
-      this.ws.addEventListener("close", () => {
+      this.ws.addEventListener("close", (event) => {
         const wasClean = this.cleanEnded || this.ending;
         void this.releaseResources();
         if (!wasClean) {
           this.callbacks.onStatus("error");
           this.callbacks.onError(
-            "The connection closed unexpectedly. Start a new conversation with a fresh token.",
+            `Connection closed unexpectedly (code ${event.code}${
+              event.reason ? `: ${event.reason}` : ""
+            }). Start a new conversation with a fresh token.`,
           );
         }
       });

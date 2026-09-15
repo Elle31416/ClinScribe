@@ -101,7 +101,7 @@ Edit `.env`:
 
 ```env
 ASSEMBLYAI_API_KEY=your_key_here
-AGENT_ID=           # filled after publish step
+AGENT_ID=agent_b0aca15004de4ab2b39bbfc1ce360956
 ```
 
 Get your API key from https://www.assemblyai.com/dashboard
@@ -164,7 +164,7 @@ Open http://localhost:3000 — localhost is a secure context, so mic permission 
 | Var | Required | Description |
 |-----|----------|-------------|
 | `ASSEMBLYAI_API_KEY` | Yes | Your AssemblyAI API key (raw key, no Bearer prefix for agent REST; Bearer for token route) |
-| `AGENT_ID` | Yes (after publish) | Stored agent ID from publish step |
+| `AGENT_ID` | Yes | Stored agent ID (`agent_b0aca15004de4ab2b39bbfc1ce360956`) |
 | `PUBLIC_BASE_URL` | No (stretch) | Public HTTPS URL for HTTP tool webhooks — not needed for client-side tool MVP |
 
 All `.env*` files are gitignored. Only `.env.example` is committed.
